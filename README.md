@@ -57,6 +57,35 @@ notice a difference. If you want the governor back on battery:
 
 Delete the marker file to re-arm the watchdog.
 
+## Using PowerTools (or similar tweak utilities)? Read this.
+
+The governor watchdog and PowerTools can step on each other's toes in exactly
+one place: **the CPU governor**. That's the only setting the watchdog writes —
+every 60 seconds, it re-asserts `performance`. If you set the governor in
+PowerTools, the watchdog will quietly override it within a minute, and it'll
+look like PowerTools "isn't sticking." It is — something is un-sticking it.
+
+**While experimenting in PowerTools, park the watchdog:**
+
+    sudo touch /etc/steam-deck-opt-manual-stop
+
+The watchdog sleeps until you remove the marker. When you're done, re-arm it:
+
+    sudo rm /etc/steam-deck-opt-manual-stop
+
+**What the watchdog never touches:** TDP, PPT, GPU clocks, frame limits —
+anything PowerTools sets stays exactly as you set it. Drop to 15W for battery,
+bump to 30W at the wall: the watchdog doesn't know and doesn't care. Deliberate
+power choices belong to you, session by session. The watchdog only defends the
+setting SteamOS itself likes to meddle with — the governor — because that's the
+one that drifts on its own after updates and power-profile switches.
+
+| Setting | Who owns it |
+|---|---|
+| CPU governor | The watchdog (defends against SteamOS meddling) |
+| TDP / PPT / GPU clocks | You, via PowerTools or BIOS (session choices) |
+| Sysctls, swap, THP, MGLRU | The boot service (set once per boot, never re-fought) |
+
 ## Quick start
 
     sudo ./steamdeckopti.sh --install     # tune everything + install persistence
