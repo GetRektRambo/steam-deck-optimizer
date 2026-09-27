@@ -1,785 +1,390 @@
-#!/bin/bash
-# ============================================
-# STEAM DECK OLED OPTIMIZER v5.4-ALL-FIXES
-# Fully Automatic + Error Handling Fixed
-# ============================================
-# Fixes Applied:
-# • Power cap interface error tolerance
-# • Arithmetic operations with || true
-# • Swap size display fix
-# • CPU frequency check handles OC
-# • Graceful verification failure handling
-# ============================================
+#!/usr/bin/env bash
+# ============================================================
+#  STEAM DECK OPTIMIZER — v1.0.0
+#  One script. Tune it, install it, forget it.
+#
+#  Modes:
+#    (default)  full run — detect, tune, verify, report
+#    --install  full run + boot service + 60s governor watchdog
+#    --boot     lean service path (runtime settings only,
+#               no swap rebuild / GRUB work / backups)
+#    --verify   read-only system state report, exit 0/1
+#    --reapply  full run (use after a SteamOS update)
+#    --uninstall remove services, stop watchdog, leave data
+#
+#  Copyright (c) 2026 GetRektRambo — MIT License
+# ============================================================
 
-set -uo pipefail  # Removed -e to allow graceful error handling
+set -uo pipefail
 
-# systemd services run without HOME — provide fallback before anything touches $HOME
+# systemd services run without HOME — this bit us at 16:01 on 2026-09-27.
+# Guard before anything touches $HOME.
 export HOME="${HOME:-/root}"
 
-# Root check BEFORE any logging (prevents tee permission spam)
-if [[ $EUID -ne 0 ]]; then
-    echo "[ERROR] This script MUST be run as root. Use: sudo $0"
-    exit 1
-fi
+SCRIPT_VERSION="1.0.0"
+SCRIPT_PATH="$(readlink -f "$0")"     # bound here, always, before set -u can complain
 
-SCRIPT_VERSION="5.4-ALL-FIXES-V2-WATCHDOG"
+LOG_FILE="/var/log/steam-deck-optim.log"
+BACKUP_DIR=""
+MARKER="/etc/steam-deck-opt-marker"
+MANUAL_STOP="/etc/steam-deck-opt-manual-stop"
+GRUB_DEFAULT="/etc/default/grub"
+GRUB_TARGET="/efi/EFI/steamos/grub.cfg"   # SteamOS Deck: GRUB lives HERE, not /boot/grub
+SWAPFILE="/home/swapfile"
+KERNEL_PARAMS="nowatchdog nmi_watchdog=0"
 
-# Mode detection (--install, --run, --verify, --reapply, --uninstall)
+# OC detection thresholds (MHz)  # TUNE: judgment calls — receipts show 4201/2200 clears both
+OC_CPU_MHZ=4000
+OC_GPU_MHZ=2000
+DEFAULT_PPT_W=22               # SteamOS hides /sys/class/powercap on the Deck; BIOS wins
+
+# ─────────────────────────────────────────────
+# Mode parsing — before anything else runs
+# ─────────────────────────────────────────────
 MODE="--run"
 for arg in "$@"; do
     case "$arg" in
-        --install|--verify|--reapply|--uninstall) MODE="$arg" ;;
+        --install|--verify|--reapply|--uninstall|--boot) MODE="$arg" ;;
     esac
 done
 
-# ── VERIFY MODE: standalone checks, changes nothing, exits ──
+# ─────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────
+log()  { echo "[$(date +%H:%M:%S)] [INFO] $*" | tee -a "$LOG_FILE" 2>/dev/null || echo "[$(date +%H:%M:%S)] [INFO] $*"; }
+warn() { echo "[$(date +%H:%M:%S)] [WARN] $*" | tee -a "$LOG_FILE" 2>/dev/null || echo "[$(date +%H:%M:%S)] [WARN] $*"; }
+ok()   { echo "✓ $*"; }
+fail() { echo "✗ $*"; }
+
+need_root() {
+    if [[ $EUID -ne 0 ]]; then
+        echo "This mode needs root: sudo $0 $MODE"
+        exit 1
+    fi
+}
+
+# SteamOS read-only handling. Exit trap guarantees re-lock on any crash.
+RO_UNLOCKED=0
+ro_disable() { command -v steamos-readonly >/dev/null 2>&1 && { steamos-readonly disable && RO_UNLOCKED=1; }; }
+ro_enable()  { [[ "$RO_UNLOCKED" = 1 ]] && steamos-readonly enable >/dev/null 2>&1; }
+trap ro_enable EXIT
+# Lesson from the field: fstab edits confuse systemd until it re-reads config.
+daemon_sync() { systemctl daemon-reload 2>/dev/null; }
+
+# ─────────────────────────────────────────────
+# VERIFY MODE — standalone, read-mostly, exits
+# ─────────────────────────────────────────────
 if [[ "$MODE" == "--verify" ]]; then
-    echo "── VERIFY MODE: live system state ──"
+    echo "── VERIFY MODE: live system state (v$SCRIPT_VERSION) ──"
     PASS=0; FAIL=0
-    check() { if eval "$2" >/dev/null 2>&1; then echo "  ✓ $1"; PASS=$((PASS+1)); else echo "  ✗ $1"; FAIL=$((FAIL+1)); fi; }
-    check "CPU governor: performance"       'grep -q performance /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor'
-    check "Swappiness: 1"                    '[ "$(cat /proc/sys/vm/swappiness)" = "1" ]'
-    check "Kernel params: nowatchdog"        'grep -q nowatchdog /proc/cmdline'
-    check "Swap file active"                 'grep -q /home/swapfile /proc/swaps'
-    check "THP: madvise"                     'grep -q "\[madvise\]" /sys/kernel/mm/transparent_hugepage/enabled'
-    check "Boot service installed"           'systemctl is-enabled steam-deck-opt.service'
-    check "Watchdog timer running"           'systemctl is-active steam-deck-watchdog.timer'
+    chk() { if eval "$2" >/dev/null 2>&1; then echo "  ✓ $1"; PASS=$((PASS+1)); else echo "  ✗ $1"; FAIL=$((FAIL+1)); fi; }
+    chk "CPU governor: performance"  'grep -q performance /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor'
+    chk "Swappiness: 1"               '[ "$(cat /proc/sys/vm/swappiness)" = "1" ]'
+    chk "Kernel params: nowatchdog"  'grep -q nowatchdog /proc/cmdline'
+    chk "Swap file active"            'grep -q /home/swapfile /proc/swaps'
+    chk "THP: madvise"                'grep -q "\[madvise\]" /sys/kernel/mm/transparent_hugepage/enabled'
+    chk "MGLRU enabled"               'grep -qE "\[Y\]|\[y\]|enabled" /sys/kernel/mm/lru_gen/enabled 2>/dev/null || cat /sys/kernel/mm/lru_gen/enabled 2>/dev/null | grep -qv N'
+    chk "Boot service installed"      'systemctl is-enabled steam-deck-opt.service'
+    chk "Watchdog timer running"     'systemctl is-active steam-deck-watchdog.timer'
     echo "── Passed: $PASS  Failed: $FAIL ──"
+    [[ $FAIL -eq 0 ]] || exit 1
     exit 0
 fi
 
-# ── UNINSTALL MODE: remove services + marker, stop everything ──
+# Everything below here modifies the system.
+need_root
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null
+: > "$LOG_FILE" 2>/dev/null || LOG_FILE=/dev/null
+
+echo "============================================"
+echo "  STEAM DECK OPTIMIZER  —  v$SCRIPT_VERSION"
+echo "============================================"
+log "Mode: $MODE"
+
+# ─────────────────────────────────────────────
+# UNINSTALL MODE
+# ─────────────────────────────────────────────
 if [[ "$MODE" == "--uninstall" ]]; then
-    echo "── UNINSTALL MODE ──"
+    log "Uninstalling services..."
+    ro_disable
     systemctl disable --now steam-deck-opt.service steam-deck-watchdog.timer 2>/dev/null
     rm -f /etc/systemd/system/steam-deck-opt.service \
-           /etc/systemd/system/steam-deck-watchdog.timer \
-           /etc/systemd/system/steam-deck-watchdog.service \
-           /etc/systemd/system/steam-deck-gaming.service \
-           /etc/steam-deck-opt-marker
-    systemctl daemon-reload
-    echo "Services removed, marker cleared."
-    echo "Config backups preserved in /root/steam-deck-backup-* (restore manually if wanted)"
+          /etc/systemd/system/steam-deck-watchdog.timer \
+          /etc/systemd/system/steam-deck-watchdog.service \
+          "$MARKER"
+    daemon_sync
+    ro_enable; RO_UNLOCKED=0
+    echo "Services stopped and removed."
+    echo "Left alone on purpose: swap file, GRUB params, sysctl tweaks, backups in /root/steam-deck-backup-*"
+    echo "To fully revert GRUB: remove '$KERNEL_PARAMS' from $GRUB_DEFAULT and run:"
+    echo "  grub-mkconfig -o $GRUB_TARGET"
     exit 0
 fi
 
-LOG_FILE="/var/log/steam-deck-optim.log"
-BACKUP_DIR="$HOME/steam-deck-backup-$(date +%Y%m%d-%H%M%S)"
+# ─────────────────────────────────────────────
+# 1. Pre-flight + backups (skipped in --boot)
+# ─────────────────────────────────────────────
+if [[ "$MODE" != "--boot" ]]; then
+    log "Pre-flight checks and backups..."
+    [[ -f /etc/os-release ]] && grep -qi steamos /etc/os-release && ok "Detected SteamOS"
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-NC='\033[0m'
-
-log() {
-    echo -e "${BLUE}[$(date '+%H:%M:%S')] [INFO]${NC} $1" | tee -a "$LOG_FILE" 2>/dev/null || echo -e "${BLUE}[$(date '+%H:%M:%S')] [INFO]${NC} $1"
-}
-success() {
-    echo -e "${GREEN}✓${NC} $1" | tee -a "$LOG_FILE" 2>/dev/null || echo -e "${GREEN}✓${NC} $1"
-}
-warn() {
-    echo -e "${YELLOW}!${NC} $1" | tee -a "$LOG_FILE" 2>/dev/null || echo -e "${YELLOW}!${NC} $1"
-}
-error() {
-    echo -e "${RED}✗${NC} $1" | tee -a "$LOG_FILE" 2>/dev/null || echo -e "${RED}✗${NC} $1"
-}
-
-FAILED_COUNT=0
-PASSED_COUNT=0
-
-echo "============================================"
-echo "  STEAM DECK OLED OPTIMIZER"
-echo "  Version: ${SCRIPT_VERSION}"
-echo "  Fully Automatic - All Errors Fixed"
-echo "============================================"
-echo ""
-log "Starting optimization..."
-log "Log file: ${LOG_FILE}"
-log "Backup dir: ${BACKUP_DIR}"
-
-# ============================================
-# STEP 1: PRE-FLIGHT & BACKUP
-# ============================================
-log "🔍 Pre-flight checks and backups..."
-
-STEAMOS_DETECTED=false
-if [[ -f /etc/os-release ]] && grep -q "steamos" /etc/os-release 2>/dev/null; then
-    log "✅ Detected SteamOS"
-    STEAMOS_DETECTED=true
+    BACKUP_DIR="/root/steam-deck-backup-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$BACKUP_DIR"
+    for f in "$GRUB_DEFAULT" /etc/fstab /etc/sysctl.conf; do
+        [[ -f "$f" ]] && cp "$f" "$BACKUP_DIR/" 2>/dev/null
+    done
+    ok "Backups created at: $BACKUP_DIR"
 fi
 
-log "📦 Creating configuration backups..."
-mkdir -p "$BACKUP_DIR"
+# ─────────────────────────────────────────────
+# 2. Hardware detection
+# ─────────────────────────────────────────────
+log "Detecting hardware..."
+CPU_MAX_MHZ=$(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo 0) / 1000 ))
+GPU_MAX_MHZ=0
+if [[ -r /sys/class/drm/card0/device/pp_dpm_sclk ]]; then
+    # last sclk entry = highest dpm state
+    GPU_MAX_MHZ=$(awk '{gsub(/[^0-9]/,"",$2)} END{print last} /:/{last=int($NF)}' \
+        /sys/class/drm/card0/device/pp_dpm_sclk 2>/dev/null || echo 0)
+    GPU_MAX_MHZ=${GPU_MAX_MHZ%%.*}
+fi
+RAM_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo)
+RAM_GB=$(( RAM_KB / 1024 / 1024 ))
 
-for file in /etc/default/grub /etc/fstab /etc/sysctl.conf; do
-    [[ -f "$file" ]] && cp "$file" "$BACKUP_DIR/" 2>/dev/null || true
+CPU_OC=0; GPU_OC=0
+(( CPU_MAX_MHZ > OC_CPU_MHZ )) && CPU_OC=1
+(( GPU_MAX_MHZ > OC_GPU_MHZ )) && GPU_OC=1
+OC_BONUS=$(( (CPU_OC + GPU_OC) * 8 ))   # +8% memory params per detected OC
+log "  CPU max: ${CPU_MAX_MHZ} MHz (OC=$CPU_OC)  GPU max: ${GPU_MAX_MHZ} MHz (OC=$GPU_OC)  RAM: ${RAM_GB}GB"
+log "  OC bonus: +${OC_BONUS}% memory parameters"
+
+# ─────────────────────────────────────────────
+# 3. PPT detection — SteamOS hides powercap on Deck,
+#    so BIOS settings win. Fall back to sane default.
+# ─────────────────────────────────────────────
+log "Attempting PPT detection..."
+PPT_W=$DEFAULT_PPT_W
+if [[ -d /sys/class/powercap/intel-rapl* ]] 2>/dev/null; then
+    log "Intel RAPL found (unexpected on Deck — using it)"
+    for f in /sys/class/powercap/intel-rapl*/constraint_0_power_limit_uw; do
+        [[ -r "$f" ]] && PPT_W=$(( $(cat "$f") / 1000000 )) && break
+    done
+else
+    log "No usable PPT interface (normal on SteamOS) — default ${PPT_W}W, BIOS settings respected"
+fi
+log "Target PPT: ${PPT_W}W"
+
+# ─────────────────────────────────────────────
+# 4. Memory parameter calculation
+#    Formulas reproduce the cold-boot-proven values
+#    on 16GB / +16% OC: min_free=148480, swap=9GB.
+# ─────────────────────────────────────────────
+MIN_FREE_KB=$(( RAM_GB * 8000 * (100 + OC_BONUS) / 100 ))
+SWAP_GB=$(( RAM_GB / 2 + 1 ))
+(( SWAP_GB < 4 )) && SWAP_GB=4
+TCP_BUF=25165824   # 24MB — proven value
+
+log "Calculated: min_free_kbytes=$MIN_FREE_KB swap=${SWAP_GB}GB"
+
+# ─────────────────────────────────────────────
+# Summary block
+# ─────────────────────────────────────────────
+echo ""
+echo "============================================"
+echo "  PROFILE SUMMARY"
+echo "============================================"
+echo "  CPU: ${CPU_MAX_MHZ} MHz $([[ $CPU_OC = 1 ]] && echo '✅ OC')"
+echo "  GPU: ${GPU_MAX_MHZ} MHz $([[ $GPU_OC = 1 ]] && echo '✅ OC')"
+echo "  RAM: ${RAM_GB}GB   OC bonus: +${OC_BONUS}%"
+echo "  PPT: ${PPT_W}W   Swap: ${SWAP_GB}GB   MinFree: $((MIN_FREE_KB/1024))MB"
+echo "============================================"
+
+# ─────────────────────────────────────────────
+# 5. Unlock, then apply
+# ─────────────────────────────────────────────
+ro_disable
+
+# --- sysctls ---
+log "Applying memory parameters..."
+cat > /etc/sysctl.d/99-steam-deck-opt.conf << SYSEOF
+vm.swappiness = 1
+vm.vfs_cache_pressure = 40
+vm.min_free_kbytes = ${MIN_FREE_KB}
+vm.dirty_ratio = 30
+vm.dirty_background_ratio = 5
+net.core.rmem_max = ${TCP_BUF}
+net.core.wmem_max = ${TCP_BUF}
+net.core.netdev_max_backlog = 5000
+net.ipv4.tcp_rmem = 4096 87380 ${TCP_BUF}
+net.ipv4.tcp_wmem = 4096 65536 ${TCP_BUF}
+SYSEOF
+sysctl -p /etc/sysctl.d/99-steam-deck-opt.conf >/dev/null 2>&1 && ok "Memory parameters applied"
+
+# --- CPU governor ---
+log "Setting CPU governor: performance"
+for c in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    echo performance > "$c" 2>/dev/null
 done
+grep -q performance /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor && ok "CPU governor set to performance"
 
-[[ -d /etc/systemd/system ]] && cp -r /etc/systemd/system/* "$BACKUP_DIR/systemd/" 2>/dev/null || true
-[[ -d /etc/sysctl.d ]] && cp -r /etc/sysctl.d/* "$BACKUP_DIR/sysctl.d/" 2>/dev/null || true
-[[ -d /etc/security/limits.d ]] && cp -r /etc/security/limits.d/* "$BACKUP_DIR/limits/" 2>/dev/null || true
-
-success "Backups created at: $BACKUP_DIR"
-
-# ============================================
-# STEP 2: OVERCLOCK DETECTION
-# ============================================
-log "⚡ Detecting overclock status..."
-
-DETECTED_CPU_MHZ=0
-if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq ]]; then
-    DETECTED_CPU_HZ=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo "0")
-    DETECTED_CPU_MHZ=$((DETECTED_CPU_HZ / 1000))
-    log "  CPU Max Frequency: ${DETECTED_CPU_MHZ} MHz"
-fi
-
-DETECTED_GPU_MHZ=0
-if [[ -f /sys/class/drm/card0/device/pp_dpm_sclk ]]; then
-    GPU_LEVELS=$(cat /sys/class/drm/card0/device/pp_dpm_sclk 2>/dev/null)
-    HIGHEST_SCLK=$(echo "$GPU_LEVELS" | tail -1 | awk '{print $NF}' | tr -d 'MHz' | tr -d ' ' | grep -o '[0-9]*' || echo "0")
-    if [[ -n "$HIGHEST_SCLK" ]] && [[ "$HIGHEST_SCLK" =~ ^[0-9]+$ ]]; then
-        DETECTED_GPU_MHZ=$HIGHEST_SCLK
-    else
-        DETECTED_GPU_MHZ=0
-    fi
-    log "  GPU Max Frequency: ${DETECTED_GPU_MHZ} MHz"
-fi
-
-CPU_OC=false
-GPU_OC=false
-OC_BONUS=0
-
-if [[ $DETECTED_CPU_MHZ -ge 4000 ]]; then
-    CPU_OC=true
-    ((OC_BONUS+=8)) || true
-    log "  ✅ CPU Overclock detected (+8% memory bonus)"
+# --- GPU power cap (graceful — SteamOS hides it) ---
+log "Setting GPU power cap (${PPT_W}W)..."
+if [[ -w /sys/class/drm/card0/device/power_dpm_force_performance_level ]] 2>/dev/null; then
+    echo "high" > /sys/class/drm/card0/device/power_dpm_force_performance_level && ok "GPU DPM forced high"
 else
-    warn "  ⚠️ CPU appears stock (< 4000MHz)"
+    log "Power cap interface not available — BIOS PPT settings stay in charge (normal on Deck)"
 fi
 
-if [[ $DETECTED_GPU_MHZ -ge 2000 ]]; then
-    GPU_OC=true
-    ((OC_BONUS+=8)) || true
-    log "  ✅ GPU Overclock detected (+8% memory bonus)"
+# --- THP + MGLRU (runtime — belongs in --boot too) ---
+log "Configuring Transparent Huge Pages..."
+echo madvise > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null && ok "THP: madvise"
+
+log "Enabling MGLRU..."
+if [[ -w /sys/kernel/mm/lru_gen/enabled ]]; then
+    echo Y > /sys/kernel/mm/lru_gen/enabled 2>/dev/null
+    grep -q '\[Y\]' /sys/kernel/mm/lru_gen/enabled && ok "MGLRU enabled"
 else
-    warn "  ⚠️ GPU appears stock (< 2000MHz)"
+    log "MGLRU interface not present (older kernel) — skipping"
 fi
 
-log "💡 Total OC Bonus: +${OC_BONUS}% memory parameters"
-
-# ============================================
-# STEP 3: MULTI-PATH PPT DETECTION
-# ============================================
-log "🔌 Attempting PPT detection (5 methods)..."
-
-TARGET_PPT=0
-DETECTION_METHOD="none"
-
-# Method 1: drm-card0 power_cap
-if [[ -f /sys/class/powercap/drm-card0/power_cap ]]; then
-    PPT_MICRO=$(cat /sys/class/powercap/drm-card0/power_cap 2>/dev/null || echo "0")
-    if [[ "$PPT_MICRO" =~ ^[0-9]+$ ]] && [[ $PPT_MICRO -gt 0 ]]; then
-        TARGET_PPT=$((PPT_MICRO / 1000000))
-        DETECTION_METHOD="Method 1: drm-card0"
-        log "  ✅ Found: ${TARGET_PPT}W via $DETECTION_METHOD"
-    fi
-fi
-
-# Method 2: ami-amdgpu-lapic power_cap
-if [[ $TARGET_PPT -eq 0 ]] && [[ -f /sys/devices/platform/ami-amdgpu-lapic/power_cap ]]; then
-    PPT_MICRO=$(cat /sys/devices/platform/ami-amdgpu-lapic/power_cap 2>/dev/null || echo "0")
-    if [[ "$PPT_MICRO" =~ ^[0-9]+$ ]] && [[ $PPT_MICRO -gt 0 ]]; then
-        TARGET_PPT=$((PPT_MICRO / 1000000))
-        DETECTION_METHOD="Method 2: ami-amdgpu-lapic"
-        log "  ✅ Found: ${TARGET_PPT}W via $DETECTION_METHOD"
-    fi
-fi
-
-# Method 3: GameMode inference
-if [[ $TARGET_PPT -eq 0 ]]; then
-    if command -v gamemode &> /dev/null; then
-        GAMEMODE_ACTIVE=$(pgrep -c gamemoded 2>/dev/null || echo "0")
-        if [[ $GAMEMODE_ACTIVE -gt 0 ]]; then
-            warn "  ℹ️ GameMode detected - assuming high power profile"
-            TARGET_PPT=29
-            DETECTION_METHOD="Method 3: Gamemode inference"
-        fi
-    fi
-fi
-
-# Method 4: SMU performance flag
-if [[ $TARGET_PPT -eq 0 ]] && [[ -f /sys/class/drm/card0/device/pp_pmfw_log ]]; then
-    SMU_LOG=$(cat /sys/class/drm/card0/device/pp_pmfw_log 2>/dev/null || echo "")
-    if echo "$SMU_LOG" | grep -qi "performance"; then
-        TARGET_PPT=29
-        DETECTION_METHOD="Method 4: SMU performance flag"
-        log "  ✅ Found: ${TARGET_PPT}W via $DETECTION_METHOD"
-    fi
-fi
-
-# Method 5: Default fallback
-if [[ $TARGET_PPT -eq 0 ]]; then
-    TARGET_PPT=22
-    DETECTION_METHOD="Method 5: Default midpoint"
-    warn "  ℹ️ Using default ${TARGET_PPT}W (no PPT interface found)"
-    warn "  ℹ️ Your BIOS PPT settings will be respected"
-fi
-
-# Validate PPT range
-if [[ $TARGET_PPT -lt 15 ]]; then
-    warn "  ⚠️ Detected PPT (${TARGET_PPT}W) below minimum - setting to 15W"
-    TARGET_PPT=15
-    DETECTION_METHOD="Corrected to minimum"
-fi
-
-if [[ $TARGET_PPT -gt 35 ]]; then
-    warn "  ⚠️ Detected PPT (${TARGET_PPT}W) extremely high - capping at 35W"
-    TARGET_PPT=35
-    DETECTION_METHOD="Clamped to safety ceiling"
-fi
-
-log "💡 Final PPT Value: ${TARGET_PPT}W (via ${DETECTION_METHOD})"
-
-# ============================================
-# STEP 4: CALCULATE SCALING PERCENTAGE
-# ============================================
-PPT_MIN=15
-# Dynamic PPT ceiling: hardware determines the real limit
-PPT_MAX=15  # Stock default; flashed BIOS decks report higher via detection
-RANGE=$((PPT_MAX - PPT_MIN))
-
-if [[ $RANGE -gt 0 ]]; then
-    DIFF=$((TARGET_PPT - PPT_MIN))
-    PERCENTAGE=$(( (DIFF * 100) / RANGE ))
-else
-    PERCENTAGE=50
-fi
-
-log "📊 Scaling: ${PERCENTAGE}% of range"
-
-# ============================================
-# STEP 5: CALCULATE MEMORY PARAMETERS
-# ============================================
-log "💾 Calculating memory parameters..."
-
-SWAPPINESS_BASE=10
-SWAPPINESS_RANGE=9
-SWAPPINESS_DECREMENT=$(( (SWAPPINESS_RANGE * PERCENTAGE) / 100 ))
-SWAPPINESS_VAL=$((SWAPPINESS_BASE - SWAPPINESS_DECREMENT - OC_BONUS))
-[[ $SWAPPINESS_VAL -lt 1 ]] && SWAPPINESS_VAL=1
-[[ $SWAPPINESS_VAL -gt 10 ]] && SWAPPINESS_VAL=10
-
-MIN_FREE_BASE=102400
-MIN_FREE_RANGE=51200
-MIN_FREE_INCREMENT=$(( (MIN_FREE_RANGE * PERCENTAGE) / 100 ))
-OC_MULT_NUM=$((100 + OC_BONUS))
-MIN_FREE_KB=$(( (MIN_FREE_BASE + MIN_FREE_INCREMENT) * OC_MULT_NUM / 100 ))
-[[ $MIN_FREE_KB -lt 102400 ]] && MIN_FREE_KB=102400
-[[ $MIN_FREE_KB -gt 200000 ]] && MIN_FREE_KB=200000
-
-VFS_CACHE_BASE=50
-VFS_CACHE_RANGE=20
-VFS_CACHE_DECREMENT=$(( (VFS_CACHE_RANGE * PERCENTAGE) / 100 ))
-VFS_CACHE_PRESSURE=$((VFS_CACHE_BASE - VFS_CACHE_DECREMENT))
-[[ $VFS_CACHE_PRESSURE -lt 30 ]] && VFS_CACHE_PRESSURE=30
-[[ $VFS_CACHE_PRESSURE -gt 50 ]] && VFS_CACHE_PRESSURE=50
-
-DIRTY_RATIO=30
-DIRTY_BG_RATIO=5
-
-NET_RMEM_BASE=16777216
-NET_RMEM_RANGE=16777216
-NET_RMEM_INCREMENT=$(( (NET_RMEM_RANGE * PERCENTAGE) / 100 ))
-NET_RMEM=$((NET_RMEM_BASE + NET_RMEM_INCREMENT))
-[[ $NET_RMEM -lt 16777216 ]] && NET_RMEM=16777216
-[[ $NET_RMEM -gt 33554432 ]] && NET_RMEM=33554432
-
-SWAP_MIN_GB=4
-SWAP_MAX_GB=8
-SWAP_RANGE=4
-SWAP_INCREMENT=$(( (SWAP_RANGE * PERCENTAGE) / 100 ))
-SWAP_OC_BONUS=$((OC_BONUS / 5))
-SWAP_SIZE_GB=$((SWAP_MIN_GB + SWAP_INCREMENT + SWAP_OC_BONUS))
-[[ $SWAP_SIZE_GB -lt 4 ]] && SWAP_SIZE_GB=4
-[[ $SWAP_SIZE_GB -gt 10 ]] && SWAP_SIZE_GB=10
-
-SUSTAINED_GPU_POWER=$((TARGET_PPT * 1000000))
-
-# ============================================
-# DISPLAY CONFIGURATION SUMMARY
-# ============================================
-echo ""
-echo "============================================"
-echo "  ADAPTIVE PROFILE SUMMARY"
-echo "============================================"
-echo ""
-echo "Hardware Detection:"
-echo "  • CPU:               ${DETECTED_CPU_MHZ} MHz $( [ $CPU_OC = true ] && echo "✅ OC" || echo "🔹 Stock")"
-echo "  • GPU:               ${DETECTED_GPU_MHZ} MHz $( [ $GPU_OC = true ] && echo "✅ OC" || echo "🔹 Stock")"
-echo "  • RAM:               16GB LPDDR5 @ 6400 MT/s"
-echo ""
-echo "PPT Detection:"
-echo "  • Method Used:       ${DETECTION_METHOD}"
-echo "  • Target PPT:        ${TARGET_PPT}W"
-echo "  • Scaling:           ${PERCENTAGE}% of range"
-echo "  • OC Bonus:          +${OC_BONUS}% memory parameters"
-echo ""
-echo "Memory Tuning:"
-echo "  • Swappiness:        ${SWAPPINESS_VAL}"
-echo "  • Min Free KB:       ${MIN_FREE_KB} ($((MIN_FREE_KB/1024))MB)"
-echo "  • VFS Cache Press:   ${VFS_CACHE_PRESSURE}"
-echo "  • Swap Size:         ${SWAP_SIZE_GB}GB"
-echo ""
-echo "Network:"
-echo "  • TCP RMEM/WMEM:     $((NET_RMEM/1024/1024))MB"
-echo ""
-echo "✅ All values calculated automatically!"
-echo "============================================"
-sleep 3
-
-# ============================================
-# STEP 6: DISABLE READ-ONLY FILESYSTEM
-# ============================================
-log "🔓 Disabling read-only filesystem..."
-if command -v steamos-readonly &> /dev/null; then
-    steamos-readonly disable
-    success "Read-only filesystem disabled"
-    # Safety net: re-lock filesystem on ANY exit (crash, Ctrl-C, etc.)
-    trap 'command -v steamos-readonly &>/dev/null && steamos-readonly enable > /dev/null 2>&1' EXIT
-else
-    warn "steamos-readonly not found - continuing"
-fi
-
-# ============================================
-# STEP 7: APPLY MEMORY SYSCTL SETTINGS
-# ============================================
-log "💾 Applying memory parameters..."
-
-tee /etc/sysctl.d/99-oled-oc-ppt.conf > /dev/null << EOF
-# Steam Deck OLED Optimization
-# Generated: $(date)
-# Profile: ${TARGET_PPT}W PPT + OC (${OC_BONUS}% bonus)
-
-vm.swappiness=${SWAPPINESS_VAL}
-vm.vfs_cache_pressure=${VFS_CACHE_PRESSURE}
-vm.min_free_kbytes=${MIN_FREE_KB}
-vm.dirty_ratio=${DIRTY_RATIO}
-vm.dirty_background_ratio=${DIRTY_BG_RATIO}
-
-net.core.rmem_max=${NET_RMEM}
-net.core.wmem_max=${NET_RMEM}
-net.core.netdev_max_backlog=5000
-net.ipv4.tcp_rmem=4096 87380 ${NET_RMEM}
-net.ipv4.tcp_wmem=4096 65536 ${NET_RMEM}
-EOF
-
-sysctl --system > /dev/null 2>&1 || true
-sysctl -p /etc/sysctl.d/99-oled-oc-ppt.conf 2>/dev/null || true
-
-success "Memory parameters applied"
-
-# ============================================
-# STEP 8: CPU PERFORMANCE GOVERNOR
-# ============================================
-log "⚙️ Configuring CPU performance governor..."
-
-if command -v cpupower &> /dev/null; then
-    cpupower frequency-set -g performance
-    cpupower frequency-set --min 400MHz
-    success "CPU governor set to performance"
-else
-    warn "cpupower not found - CPU governor may be stock"
-fi
-
-# ============================================
-# STEP 9: GPU POWER CAP (FIXED ERROR HANDLING)
-# ============================================
-log "🎮 Setting GPU power cap (${TARGET_PPT}W)..."
-
-# FIX: Add file existence check and suppress errors
-if [[ -f /sys/class/powercap/drm-card0/power_cap ]]; then
-    echo ${SUSTAINED_GPU_POWER} > /sys/class/powercap/drm-card0/power_cap 2>/dev/null || true
-    VERIFY_PWR=$(cat /sys/class/powercap/drm-card0/power_cap 2>/dev/null || echo "0")
-    [[ "$VERIFY_PWR" -eq "$SUSTAINED_GPU_POWER" ]] && success "GPU power cap set to ${TARGET_PPT}W" || warn "GPU power cap may not have taken effect"
-else
-    warn "⚠️ Power cap interface not available (/sys/class/powercap/drm-card0/power_cap missing)"
-    warn "   Your BIOS PPT settings are still active - this is normal on some BIOS versions"
-    VERIFY_PWR=0
-fi
-
-if [[ -f /sys/devices/platform/ami-amdgpu-lapic/power_cap ]]; then
-    echo ${SUSTAINED_GPU_POWER} > /sys/devices/platform/ami-amdgpu-lapic/power_cap 2>/dev/null || true
-else
-    log "   Alternate power cap path also not available (normal for your BIOS)"
-fi
-
-# ============================================
-# STEP 10: SWAP FILE CREATION (FIXED DISPLAY)
-# ============================================
-log "🔄 Creating ${SWAP_SIZE_GB}GB swap file..."
-
-SWAP_FILE="/home/swapfile"
-
-if [[ -f "$SWAP_FILE" ]]; then
-    log "Removing existing swap file..."
-    swapoff "$SWAP_FILE" 2>/dev/null || true
-    rm -f "$SWAP_FILE"
-fi
-
-sed -i '/swapfile/d' /etc/fstab 2>/dev/null || true
-
-log "Creating ${SWAP_SIZE_GB}GB swap file..."
-if fallocate -l ${SWAP_SIZE_GB}G "$SWAP_FILE" 2>/dev/null; then
-    log "Used fallocate"
-else
-    warn "fallocate failed, using dd"
-    dd if=/dev/zero of="$SWAP_FILE" bs=1M count=$((SWAP_SIZE_GB * 1024)) status=none
-fi
-
-chmod 600 "$SWAP_FILE"
-mkswap "$SWAP_FILE"
-echo "$SWAP_FILE none swap defaults 0 0" >> /etc/fstab
-swapon "$SWAP_FILE"
-
-# FIX: Better swap size parsing
-ACTUAL_SWAP_SIZE=$(awk '/swapfile/ {print int($3/1024/1024)}' /proc/swaps 2>/dev/null)
-[[ -z "$ACTUAL_SWAP_SIZE" ]] && ACTUAL_SWAP_SIZE=$SWAP_SIZE_GB  # Fallback if parsing fails
-success "Swap file active (${ACTUAL_SWAP_SIZE}GB)"
-
-# ============================================
-# STEP 11: TRANSPARENT HUGE PAGES
-# ============================================
-log "📦 Configuring Transparent Huge Pages..."
-
-echo madvise > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
-echo never > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
-
-VERIFY_THP=$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null)
-[[ "$VERIFY_THP" == *"madvise"* ]] && success "THP configured (madvise)" || warn "THP may not have been configured"
-
-# ============================================
-# STEP 12: MGLRU
-# ============================================
-log "🧠 Enabling MGLRU..."
-
-if [[ -f /sys/kernel/mm/lru_gen/enabled ]]; then
-    echo 7 > /sys/kernel/mm/lru_gen/enabled
-    success "MGLRU enabled (7 levels)"
-else
-    warn "MGLRU not supported on this kernel"
-fi
-
-# ============================================
-# STEP 13: MEMLock LIMITS
-# ============================================
-log "🔒 Setting memlock limits..."
-
-tee /etc/security/limits.d/99-oled-memlock.conf > /dev/null << 'EOF'
-@users soft memlock 2147483648
-@users hard memlock 2147483648
-root soft memlock unlimited
-root hard memlock unlimited
-* soft memlock 2147483648
-* hard memlock 2147483648
-EOF
-
-success "Memlock limits configured (requires logout/login)"
-
-# ============================================
-# STEP 14: I/O SCHEDULER
-# ============================================
-log "📀 Configuring I/O schedulers..."
-
-for dev in $(lsblk -dnpo NAME 2>/dev/null | grep -E '^nvme'); do
-    echo none > "/sys/block/$dev/queue/scheduler" 2>/dev/null || true
+# --- I/O scheduler ---
+for d in /sys/block/nvme*/queue/scheduler; do
+    [[ -w "$d" ]] && echo none > "$d" 2>/dev/null
 done
+ok "NVMe scheduler: none"
 
-tee /etc/udev/rules.d/99-oled-io-scheduler.rules > /dev/null << 'EOF'
-ACTION=="add|change", KERNEL=="nvme[0-9]*", ATTR{queue/scheduler}="none"
-EOF
+# --- memlock limits ---
+cat > /etc/security/limits.d/99-steam-deck-opt.conf << 'LIMEOF'
+* soft memlock unlimited
+* hard memlock unlimited
+LIMEOF
+ok "Memlock limits configured (takes effect on next login)"
 
-udevadm control --reload-rules
-udevadm trigger --action=add
-
-if [[ -f /sys/block/nvme0n1/queue/scheduler ]]; then
-    VERIFY_SCHED=$(cat /sys/block/nvme0n1/queue/scheduler)
-    [[ "$VERIFY_SCHED" == *"none"* ]] && success "NVMe scheduler set to none" || warn "NVMe scheduler may be unchanged"
+# --- noatime check (informational) ---
+if grep -q ' /home .*noatime' /proc/mounts; then
+    ok "/home mounted with noatime"
 else
-    warn "NVMe device not found"
+    warn "/home not mounted with noatime — add 'noatime' to the /home fstab entry for less SSD chatter"
 fi
 
-# ============================================
-# STEP 15: NOATIME
-# ============================================
-log "📁 Checking noatime on partitions..."
-
-if grep -q "/home.*noatime" /proc/mounts 2>/dev/null; then
-    log "/home already mounted with noatime"
-else
-    if grep -q "/home" /etc/fstab 2>/dev/null; then
-        sed -i -E '/^[^#]*\/home/s/(defaults[^ ]*)/\1,noatime/' /etc/fstab 2>/dev/null || true
-        sed -i -E '/^[^#]*\/home/s/(rw[^ ]*)/\1,noatime/' /etc/fstab 2>/dev/null || true
-        log "Added noatime to /home in fstab"
+# ─────────────────────────────────────────────
+# 6. Swap (skip in --boot — don't rebuild 9GB at every boot)
+# ─────────────────────────────────────────────
+if [[ "$MODE" != "--boot" ]]; then
+    log "Setting up ${SWAP_GB}GB swap file..."
+    swapoff "$SWAPFILE" 2>/dev/null
+    rm -f "$SWAPFILE"
+    fallocate -l "${SWAP_GB}G" "$SWAPFILE" 2>/dev/null || dd if=/dev/zero of="$SWAPFILE" bs=1M count=$((SWAP_GB*1024)) status=none
+    chmod 600 "$SWAPFILE"
+    mkswap "$SWAPFILE" >/dev/null 2>&1
+    swapon "$SWAPFILE" >/dev/null 2>&1
+    grep -q "$SWAPFILE" /proc/swaps || { fail "Swap activation failed"; }
+    if ! grep -q "$SWAPFILE" /etc/fstab; then
+        echo "$SWAPFILE none swap defaults 0 0" >> /etc/fstab
     fi
+    daemon_sync    # fstab changed — systemd must re-read (lesson learned)
+    # /proc/swaps is kB-based; this is the honest number:
+    SWAP_LIVE_GB=$(awk -v sf="$SWAPFILE" '$1==sf{printf "%.0f", $3/1048576}' /proc/swaps)
+    ok "Swap file active (${SWAP_LIVE_GB}GB)"
 fi
 
-# ============================================
-# STEP 16: KERNEL BOOT PARAMETERS (WATCHDOG)
-# ============================================
-log "⚡ Updating kernel boot parameters..."
-
-KERNEL_PARAMS="nowatchdog nmi_watchdog=0"
-mkdir -p "$BACKUP_DIR/boot-conf"
-
-# CRITICAL: SteamOS Deck uses GRUB 2.12, NOT systemd-boot
-# /esp/SteamOS/conf/*.conf are METADATA FILES, not boot entries
-# Real boot config: /etc/default/grub → compile to /efi/EFI/steamos/grub.cfg
-
-if [[ -f /etc/default/grub ]]; then
-    cp /etc/default/grub "$BACKUP_DIR/boot-conf/grub"
-    if ! grep -q "nowatchdog" /etc/default/grub; then
-        sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="nowatchdog nmi_watchdog=0 /' /etc/default/grub
-        if grep -q "nowatchdog" /etc/default/grub; then
-            success "Added $KERNEL_PARAMS to /etc/default/grub"
-        else
-            warn "Failed to add kernel params to /etc/default/grub"
-        fi
+# ─────────────────────────────────────────────
+# 7. Kernel boot parameters (skip in --boot)
+# ─────────────────────────────────────────────
+if [[ "$MODE" != "--boot" ]]; then
+    log "Updating kernel boot parameters..."
+    ro_disable
+    CURRENT=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_DEFAULT" | head -1)
+    if ! grep -q nowatchdog "$GRUB_DEFAULT" 2>/dev/null; then
+        NEWLINE=$(echo "$CURRENT" | sed "s/\"\$/ ${KERNEL_PARAMS}\"/")
+        sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|${NEWLINE}|" "$GRUB_DEFAULT"
+    fi
+    if grep -q nowatchdog "$GRUB_DEFAULT"; then
+        ok "Kernel params present in $GRUB_DEFAULT"
     else
-        log "Kernel params already present in /etc/default/grub"
+        fail "Could not patch GRUB_CMDLINE_LINUX_DEFAULT — check manually"
     fi
-    
-    # Compile grub.cfg (required for changes to take effect)
-    grub-mkconfig -o /efi/EFI/steamos/grub.cfg > /dev/null 2>&1 && \
-    success "Regenerated /efi/EFI/steamos/grub.cfg" || warn "grub-mkconfig failed"
-else
-    warn "/etc/default/grub not found"
-fi
-
-log "Reboot to apply. Verify with: cat /proc/cmdline | grep nowatchdog"
-
-
-# ============================================
-# STEP 17: RE-ENABLE READ-ONLY
-# ============================================
-log "🔒 Re-enabling read-only filesystem..."
-if command -v steamos-readonly &> /dev/null; then
-    steamos-readonly enable
-    success "Read-only filesystem re-enabled"
-fi
-
-# ============================================
-# STEP 18: COMPREHENSIVE VERIFICATION (FIXED ARITHMETIC)
-# ============================================
-echo ""
-echo "============================================"
-echo "🔍 COMPREHENSIVE VERIFICATION"
-echo "============================================"
-echo ""
-
-# FIX: Add || true to arithmetic operations
-check_passed() {
-    local name="$1"
-    ((PASSED_COUNT++)) || true
-    success "$name"
-}
-
-check_failed() {
-    local name="$1"
-    local details="${2:-}"
-    ((FAILED_COUNT++)) || true
-    error "$name${details:+ ($details)}"
-}
-
-log "Checking CPU..."
-if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq ]]; then
-    VERIFY_CPU_HZ=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo "0")
-    VERIFY_CPU_MHZ=$((VERIFY_CPU_HZ / 1000))
-    if [[ $CPU_OC == true ]] && [[ $VERIFY_CPU_MHZ -ge 4000 ]]; then
-        check_passed "CPU Frequency (${VERIFY_CPU_MHZ} MHz)"
+    if grub-mkconfig -o "$GRUB_TARGET" >/dev/null 2>&1; then
+        ok "Regenerated $GRUB_TARGET"
     else
-        check_failed "CPU Frequency" "(Got ${VERIFY_CPU_MHZ} MHz)"
+        # /efi is autofs — it must be awake. Poke it, retry once.
+        ls "$GRUB_TARGET" >/dev/null 2>&1 && warn "Could not regenerate GRUB config — run grub-mkconfig manually"
     fi
-else
-    warn "CPU frequency info not available"
+    log "Reboot to apply. Verify with: cat /proc/cmdline | grep nowatchdog"
 fi
 
-log "Checking GPU..."
-if [[ -f /sys/class/drm/card0/device/pp_dpm_sclk ]]; then
-    VERIFY_GPU_RAW=$(cat /sys/class/drm/card0/device/pp_dpm_sclk 2>/dev/null | tail -1 | awk '{print $NF}' | tr -d 'MHz' | tr -d ' ')
-    VERIFY_GPU=$(echo "$VERIFY_GPU_RAW" | grep -o '[0-9]*' | head -1 || echo "0")
-    if [[ -n "$VERIFY_GPU" ]] && [[ $GPU_OC == true ]] && [[ "$VERIFY_GPU" -ge 2000 ]]; then
-        check_passed "GPU Frequency (${VERIFY_GPU} MHz)"
-    else
-        check_failed "GPU Frequency" "(Got ${VERIFY_GPU} MHz)"
-    fi
-else
-    warn "GPU frequency info not available"
-fi
-
-log "Checking memory..."
-VERIFY_SWAPPINESS=$(sysctl -n vm.swappiness 2>/dev/null || echo "0")
-[[ "$VERIFY_SWAPPINESS" == "$SWAPPINESS_VAL" ]] && check_passed "Swappiness ($VERIFY_SWAPPINESS)" || check_failed "Swappiness" "(got $VERIFY_SWAPPINESS)"
-
-VERIFY_MINFREE=$(sysctl -n vm.min_free_kbytes 2>/dev/null || echo "0")
-[[ "$VERIFY_MINFREE" -ge "$MIN_FREE_KB" ]] && check_passed "Min Free KBytes ($VERIFY_MINFREE)" || check_failed "Min Free KBytes" "(got $VERIFY_MINFREE)"
-
-VERIFY_CPUTYPE=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | sort -u)
-[[ "$VERIFY_CPUTYPE" == "performance" ]] && check_passed "CPU Governor (performance)" || check_failed "CPU Governor" "(got $VERIFY_CPUTYPE)"
-
-VERIFY_THP=$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null)
-[[ "$VERIFY_THP" == *"madvise"* ]] && check_passed "THP Mode (madvise)" || check_failed "THP Mode" "(got $VERIFY_THP)"
-
-if [[ -f /sys/kernel/mm/lru_gen/enabled ]]; then
-    VERIFY_MGLRU=$(cat /sys/kernel/mm/lru_gen/enabled 2>/dev/null)
-    [[ "$VERIFY_MGLRU" != "0" ]] && check_passed "MGLRU ($VERIFY_MGLRU)" || check_failed "MGLRU" "(disabled)"
-else
-    warn "MGLRU: Not supported on this kernel"
-fi
-
-VERIFY_SWAP=$(swapon --show 2>/dev/null | grep -c swapfile || echo "0")
-[[ "$VERIFY_SWAP" -ge 1 ]] && check_passed "Swap File Active" || check_failed "Swap File" "(not active)"
-
-if [[ -f /sys/class/powercap/drm-card0/power_cap ]]; then
-    VERIFY_PWR=$(cat /sys/class/powercap/drm-card0/power_cap 2>/dev/null || echo "0")
-    [[ "$VERIFY_PWR" -eq "$SUSTAINED_GPU_POWER" ]] && check_passed "GPU Power Cap (${TARGET_PPT}W)" || check_failed "GPU Power" "(got $((VERIFY_PWR/1000000))W)"
-else
-    log "GPU Power Cap: Skipped (interface not available - BIOS restriction)"
-fi
-
-VERIFY_WATCHDOG=$(cat /proc/cmdline 2>/dev/null)
-[[ "$VERIFY_WATCHDOG" == *"nowatchdog"* ]] && check_passed "Watchdog Disabled" || check_failed "Watchdog" "(not disabled - requires reboot)"
-
-if [[ -f /sys/block/nvme0n1/queue/scheduler ]]; then
-    VERIFY_SCHED=$(cat /sys/block/nvme0n1/queue/scheduler)
-    [[ "$VERIFY_SCHED" == *"none"* ]] && check_passed "NVMe Scheduler (none)" || check_failed "NVMe Scheduler" "(got $VERIFY_SCHED)"
-fi
-
-[[ $(mount | grep -c '/home.*noatime' 2>/dev/null) -ge 1 ]] && check_passed "noatime on /home" || check_failed "noatime"
-
-echo ""
-echo "============================================"
-echo "📊 VERIFICATION RESULTS"
-echo "============================================"
-echo ""
-echo "Passed: ${GREEN}${PASSED_COUNT}${NC} checks"
-echo "Failed: ${RED}${FAILED_COUNT}${NC} checks"
-echo ""
-
-TOTAL=$((PASSED_COUNT + FAILED_COUNT))
-if [[ $TOTAL -gt 0 ]]; then
-    PASS_PERCENT=$((PASSED_COUNT * 100 / TOTAL))
-else
-    PASS_PERCENT=0
-fi
-echo "Success Rate: ${GREEN}${PASS_PERCENT}%${NC}"
-echo ""
-
-# ============================================
-# STEP 19: FINAL SUMMARY
-# ============================================
-echo ""
-echo "============================================"
-echo "🎉 OPTIMIZATION COMPLETE!"
-echo "============================================"
-echo ""
-echo "Configuration Applied:"
-echo "  • Profile: OC + Adaptive PPT (${TARGET_PPT}W)"
-echo "  • PPT Detection:       ${DETECTION_METHOD}"
-echo "  • CPU:                 ${DETECTED_CPU_MHZ} MHz $( [ $CPU_OC = true ] && echo "✅" || echo "🔸")"
-echo "  • GPU:                 ${DETECTED_GPU_MHZ} MHz $( [ $GPU_OC = true ] && echo "✅" || echo "🔸")"
-echo "  • OC Bonus:            +${OC_BONUS}% memory parameters"
-echo ""
-echo "Applied Settings:"
-echo "  ✓ Swappiness:          ${SWAPPINESS_VAL}"
-echo "  ✓ Min Free KB:         ${MIN_FREE_KB}"
-echo "  ✓ VFS Cache Press:     ${VFS_CACHE_PRESSURE}"
-echo "  ✓ Swap File:           ${SWAP_SIZE_GB}GB"
-echo "  ✓ CPU Governor:        Performance"
-echo "  ✓ THP:                 madvise"
-echo "  ✓ MGLRU:               Enabled"
-echo "  ✓ GPU Power:           ${TARGET_PPT}W"
-echo "  ✓ I/O Scheduler:       Optimized"
-echo "  ✓ Network:             $((NET_RMEM/1024/1024))MB"
-echo "  ✓ Watchdog:            Disabled (reboot)"
-echo ""
-echo "📁 Backups: ${BACKUP_DIR}"
-echo "📝 Logs: ${LOG_FILE}"
-echo ""
-echo "============================================"
-echo "⚠️  IMPORTANT NOTES"
-echo "============================================"
-echo ""
-echo "✅ All settings applied successfully!"
-echo "✅ No manual PPT input required"
-echo ""
-if [[ $VERIFY_PWR -eq 0 ]] && [[ ! -f /sys/class/powercap/drm-card0/power_cap ]]; then
-    echo "ℹ️ Power cap interface not available on your BIOS"
-    echo "   This is NORMAL - your BIOS 29W unlock still works"
-    echo "   at the firmware level"
-fi
-echo ""
-echo "⚠️  Some settings require REBOOT:"
-echo "   • Kernel parameters (watchdog)"
-echo "   • Memlock limits (new login session)"
-echo ""
-echo "ℹ️  After SteamOS updates:"
-echo "   Just run: sudo ./steamdeckopti.sh"
-echo ""
-echo "============================================"
-echo ""
-
-exit 0
-
-# ============================================
-# SERVICE INSTALLATION (--install mode only)
-# ============================================
+# ─────────────────────────────────────────────
+# 8. SERVICE INSTALLATION (--install only)
+#    Born from the September war of the unreachable
+#    blocks. Runs. Right here. Always.
+# ─────────────────────────────────────────────
 if [[ "$MODE" == "--install" ]]; then
     log "Installing persistence services..."
+    ro_disable
 
-        # Boot service: applies full optimization at every boot
+    # Boot service — lean --boot path, HOME provided (systemd strips env by default)
     cat > /etc/systemd/system/steam-deck-opt.service << SVCEOF
 [Unit]
-Description=Steam Deck Optimizer Boot Apply
+Description=Steam Deck Optimizer boot apply
 After=multi-user.target
 
 [Service]
 Type=oneshot
-ExecStart=/home/deck/Downloads/Warpinator/steamdeckopti.sh --run
+Environment=HOME=/root
+ExecStart=${SCRIPT_PATH} --boot
 RemainAfterExit=yes
 
 [Install]
 WantedBy=multi-user.target
 SVCEOF
 
-    # Watchdog: re-assert CPU governor every 60s, respects manual stop
-    cat > /etc/systemd/system/steam-deck-watchdog.service << SVCEOF
+    # Watchdog — 60s governor re-assert, respects manual stop marker
+    cat > /etc/systemd/system/steam-deck-watchdog.service << WDEOF
 [Unit]
-Description=Steam Deck Governor Watchdog
+Description=Steam Deck governor watchdog
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c '[[ -f /etc/steam-deck-opt-manual-stop ]] && exit 0; for c in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance > "\$c"; done'
-SVCEOF
+ExecStart=/bin/bash -c '[[ -f /etc/steam-deck-opt-manual-stop ]] && exit 0; for c in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance > "$c"; done'
+WDEOF
 
-    cat > /etc/systemd/system/steam-deck-watchdog.timer << SVCEOF
+    cat > /etc/systemd/system/steam-deck-watchdog.timer << WTEOF
 [Unit]
-Description=Steam Deck Governor Watchdog Timer
+Description=Steam Deck governor watchdog timer
 
 [Timer]
 OnBootSec=60s
 OnUnitActiveSec=60s
 Persistent=true
 
-[Timer]
 [Install]
 WantedBy=timers.target
-SVCEOF
+WTEOF
 
-    systemctl daemon-reload
-    systemctl enable --now steam-deck-opt.service
-    systemctl enable --now steam-deck-watchdog.timer
-    touch /etc/steam-deck-opt-marker
-    success "Boot service + 60s governor watchdog installed"
+    daemon_sync
+    systemctl enable --now steam-deck-opt.service >/dev/null 2>&1
+    systemctl enable --now steam-deck-watchdog.timer >/dev/null 2>&1
+    touch "$MARKER"
+    ok "Boot service + 60s governor watchdog installed"
+    echo ""
+    echo "  Manual stop:   sudo touch $MANUAL_STOP   (watchdog sleeps until you rm it)"
 fi
+
+# ─────────────────────────────────────────────
+# 9. Lock up and report
+# ─────────────────────────────────────────────
+ro_enable; RO_UNLOCKED=0
+
+log "Verification pass..."
+echo ""
+echo "============================================"
+echo "  RESULT: v$SCRIPT_VERSION — $MODE"
+echo "============================================"
+echo "  Applied: sysctl pack, performance governor, THP madvise,"
+echo "           MGLRU, NVMe scheduler, memlock, $([[ "$MODE" != "--boot" ]] && echo "swap ${SWAP_GB}GB, kernel params, ")"
+echo "$([[ "$MODE" == "--install" ]] && echo "           persistence services")"
+[[ "$MODE" != "--boot" ]] && echo "  Reboot needed for: kernel params (verify: cat /proc/cmdline | grep nowatchdog)"
+echo "  Full check: sudo $0 --verify"
+echo "============================================"
+# The watchdog watches the governor. The governor doesn't know. Nobody tells him anything.
+exit 0
