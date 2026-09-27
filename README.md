@@ -23,6 +23,7 @@ and SteamOS updates instead of silently reverting.
 | I/O scheduler | mq-deadline on NVMe | none (native NVMe queueing) |
 | TCP buffers | ~4MB max | 24MB |
 | Persistence | none — reverts on reboot | boot service + 60s governor watchdog |
+| SSD TRIM | Game Mode maintenance only | weekly fstrim timer (desktop mode included) |
 
 ## The honest expectations
 
@@ -90,7 +91,7 @@ one that drifts on its own after updates and power-profile switches.
 
     sudo ./steamdeckopti.sh --install     # tune everything + install persistence
     sudo reboot                            # kernel params apply here
-    sudo ./steamdeckopti.sh --verify       # want: 8/8
+    sudo ./steamdeckopti.sh --verify       # want: 9/9
 
 That's it. From now on, every boot runs the lean tuning path and a
 watchdog re-asserts the governor every 60 seconds.
@@ -101,7 +102,7 @@ watchdog re-asserts the governor every 60 seconds.
 |---|---|
 | *(none)* | Full detect-tune-verify run |
 | `--install` | Full run + boot service + watchdog timer |
-| `--verify` | Read-only report of live state, 8 checks, exit 0/1 |
+| `--verify` | Read-only report of live state, 9 checks, exit 0/1 |
 | `--reapply` | Full run — use after a SteamOS update nukes things |
 | `--uninstall` | Removes services. Leaves swap, GRUB params, sysctls, and backups alone |
 
@@ -128,6 +129,11 @@ cost an evening to discover:
 - **systemd services have no HOME.** A `set -u` script that touches
   `$HOME` dies instantly at boot. The service carries
   `Environment=HOME=/root` for exactly this reason.
+- **SteamOS only TRIMs the SSD in Game Mode.** Desktop-mode sessions never
+  trigger maintenance TRIM, so a Deck that lives in desktop mode accumulates
+  untrimmed blocks indefinitely. (First manual run on the author's machine:
+  120GB trimmed.) The weekly timer closes that gap — stock `fstrim.timer`
+  if present, custom fallback if not.
 
 ## Hardware detection
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.0.3 — 2026-09-27
+- Weekly SSD TRIM timer added to `--install` (custom `steam-deck-trim.timer`,
+  cleaned up by `--uninstall`). SteamOS only TRIMs during Game Mode
+  maintenance — desktop-mode Decks never get it. First manual run on the
+  author's machine trimmed 120GB.
+- Verify mode now 9 checks.
+
 ## v1.0.2 — 2026-09-27
 - GPU sclk detection rewritten: scan all DRM cards, parse by regex.
   Fixes GPU max reading 0 MHz on boots where the APU lands on a different
