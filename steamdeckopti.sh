@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  STEAM DECK OPTIMIZER — v1.0.0
+#  STEAM DECK OPTIMIZER — v1.0.2
 #  One script. Tune it, install it, forget it.
 #
 #  Modes:
