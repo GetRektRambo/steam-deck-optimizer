@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-#  STEAM DECK OPTIMIZER — v1.0.2
+#  STEAM DECK OPTIMIZER — v1.0.3
 #  One script. Tune it, install it, forget it.
 #
 #  Modes:
@@ -21,7 +21,7 @@ set -uo pipefail
 # Guard before anything touches $HOME.
 export HOME="${HOME:-/root}"
 
-SCRIPT_VERSION="1.0.2"
+SCRIPT_VERSION="1.0.3"
 SCRIPT_PATH="$(readlink -f "$0")"     # bound here, always, before set -u can complain
 
 LOG_FILE="/var/log/steam-deck-optim.log"
@@ -86,6 +86,7 @@ if [[ "$MODE" == "--verify" ]]; then
     chk "MGLRU enabled"               'grep -qE "\[Y\]|0x000[1-7]" /sys/kernel/mm/lru_gen/enabled 2>/dev/null'
     chk "Boot service installed"      'systemctl is-enabled steam-deck-opt.service'
     chk "Watchdog timer running"     'systemctl is-active steam-deck-watchdog.timer'
+    chk "Weekly TRIM enabled"       'systemctl is-enabled steam-deck-trim.timer'
     echo "── Passed: $PASS  Failed: $FAIL ──"
     [[ $FAIL -eq 0 ]] || exit 1
     exit 0
@@ -107,10 +108,12 @@ log "Mode: $MODE"
 if [[ "$MODE" == "--uninstall" ]]; then
     log "Uninstalling services..."
     ro_disable
-    systemctl disable --now steam-deck-opt.service steam-deck-watchdog.timer 2>/dev/null
+    systemctl disable --now steam-deck-opt.service steam-deck-watchdog.timer steam-deck-trim.timer 2>/dev/null
     rm -f /etc/systemd/system/steam-deck-opt.service \
           /etc/systemd/system/steam-deck-watchdog.timer \
           /etc/systemd/system/steam-deck-watchdog.service \
+          /etc/systemd/system/steam-deck-trim.timer \
+          /etc/systemd/system/steam-deck-trim.service \
           "$MARKER"
     daemon_sync
     ro_enable; RO_UNLOCKED=0
@@ -366,7 +369,29 @@ WTEOF
 
     daemon_sync
     systemctl enable --now steam-deck-opt.service >/dev/null 2>&1
-    systemctl enable --now steam-deck-watchdog.timer >/dev/null 2>&1
+    systemctl enable --now steam-deck-watchdog.timer
+
+    # Weekly SSD TRIM — silent maintenance, preserves NVMe performance
+    cat > /etc/systemd/system/steam-deck-trim.service << TRIMEOF
+[Unit]
+Description=SSD TRIM Maintenance
+[Service]
+Type=oneshot
+ExecStart=/sbin/fstrim -av
+TRIMEOF
+    cat > /etc/systemd/system/steam-deck-trim.timer << TRIMEOF
+[Unit]
+Description=Weekly SSD TRIM Timer
+[Timer]
+OnCalendar=weekly
+Persistent=true
+[Install]
+WantedBy=timers.target
+TRIMEOF
+    systemctl enable --now steam-deck-trim.timer
+    ok "Weekly SSD TRIM enabled"
+
+ >/dev/null 2>&1
     touch "$MARKER"
     ok "Boot service + 60s governor watchdog installed"
     echo ""
