@@ -21,7 +21,7 @@ set -uo pipefail
 # Guard before anything touches $HOME.
 export HOME="${HOME:-/root}"
 
-SCRIPT_VERSION="1.0.1"
+SCRIPT_VERSION="1.0.2"
 SCRIPT_PATH="$(readlink -f "$0")"     # bound here, always, before set -u can complain
 
 LOG_FILE="/var/log/steam-deck-optim.log"
@@ -141,13 +141,13 @@ fi
 # ─────────────────────────────────────────────
 log "Detecting hardware..."
 CPU_MAX_MHZ=$(( $(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null || echo 0) / 1000 ))
+# GPU max = highest sclk dpm state across any DRM card (index varies between boots)
 GPU_MAX_MHZ=0
-if [[ -r /sys/class/drm/card0/device/pp_dpm_sclk ]]; then
-    # last sclk entry = highest dpm state
-    GPU_MAX_MHZ=$(awk '{gsub(/[^0-9]/,"",$2)} END{print last} /:/{last=int($NF)}' \
-        /sys/class/drm/card0/device/pp_dpm_sclk 2>/dev/null || echo 0)
-    GPU_MAX_MHZ=${GPU_MAX_MHZ%%.*}
-fi
+for sclk in /sys/class/drm/card*/device/pp_dpm_sclk; do
+    [[ -r "$sclk" ]] || continue
+    v=$(grep -oE '[0-9]+M' "$sclk" | tr -d 'M' | sort -n | tail -1)
+    [[ -n "$v" ]] && (( v > GPU_MAX_MHZ )) && GPU_MAX_MHZ=$v
+done
 # /proc/meminfo excludes the GPU carve-out (OLED BIOS reserves ~4GiB).
 # Physical RAM = MemTotal + mem_info_vram_total, rounded to nearest GB.
 RAM_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo)
