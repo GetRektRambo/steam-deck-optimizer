@@ -21,7 +21,7 @@ set -uo pipefail
 # Guard before anything touches $HOME.
 export HOME="${HOME:-/root}"
 
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.0.1"
 SCRIPT_PATH="$(readlink -f "$0")"     # bound here, always, before set -u can complain
 
 LOG_FILE="/var/log/steam-deck-optim.log"
@@ -83,7 +83,7 @@ if [[ "$MODE" == "--verify" ]]; then
     chk "Kernel params: nowatchdog"  'grep -q nowatchdog /proc/cmdline'
     chk "Swap file active"            'grep -q /home/swapfile /proc/swaps'
     chk "THP: madvise"                'grep -q "\[madvise\]" /sys/kernel/mm/transparent_hugepage/enabled'
-    chk "MGLRU enabled"               'grep -qE "\[Y\]|\[y\]|enabled" /sys/kernel/mm/lru_gen/enabled 2>/dev/null || cat /sys/kernel/mm/lru_gen/enabled 2>/dev/null | grep -qv N'
+    chk "MGLRU enabled"               'grep -qE "\[Y\]|0x000[1-7]" /sys/kernel/mm/lru_gen/enabled 2>/dev/null'
     chk "Boot service installed"      'systemctl is-enabled steam-deck-opt.service'
     chk "Watchdog timer running"     'systemctl is-active steam-deck-watchdog.timer'
     echo "── Passed: $PASS  Failed: $FAIL ──"
@@ -148,8 +148,11 @@ if [[ -r /sys/class/drm/card0/device/pp_dpm_sclk ]]; then
         /sys/class/drm/card0/device/pp_dpm_sclk 2>/dev/null || echo 0)
     GPU_MAX_MHZ=${GPU_MAX_MHZ%%.*}
 fi
+# /proc/meminfo excludes the GPU carve-out (OLED BIOS reserves ~4GiB).
+# Physical RAM = MemTotal + mem_info_vram_total, rounded to nearest GB.
 RAM_KB=$(awk '/MemTotal/{print $2}' /proc/meminfo)
-RAM_GB=$(( RAM_KB / 1024 / 1024 ))
+VRAM_KB=$(( $(cat /sys/class/drm/card0/device/mem_info_vram_total 2>/dev/null || echo 0) / 1024 ))
+RAM_GB=$(( (RAM_KB + VRAM_KB + 524288) / 1048576 ))
 
 CPU_OC=0; GPU_OC=0
 (( CPU_MAX_MHZ > OC_CPU_MHZ )) && CPU_OC=1
@@ -242,7 +245,7 @@ echo madvise > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null && ok "TH
 log "Enabling MGLRU..."
 if [[ -w /sys/kernel/mm/lru_gen/enabled ]]; then
     echo Y > /sys/kernel/mm/lru_gen/enabled 2>/dev/null
-    grep -q '\[Y\]' /sys/kernel/mm/lru_gen/enabled && ok "MGLRU enabled"
+    grep -qE '\[Y\]|0x000[1-7]' /sys/kernel/mm/lru_gen/enabled && ok "MGLRU enabled (levels: $(cat /sys/kernel/mm/lru_gen/enabled))"
 else
     log "MGLRU interface not present (older kernel) — skipping"
 fi
