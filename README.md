@@ -1,6 +1,6 @@
 # SteamOS Optimizer
 
-A single-script system optimizer for handhelds running SteamOS (Script designed for steam deck) - has been tested on a Rog Ally Z1 Extreme running SteamOS. works as intended.
+A single-script system optimizer for handhelds running SteamOS. Designed for the Steam Deck — also confirmed working on a ROG Ally Z1 Extreme, all 9 verify checks pass.
 
 One script, six modes, one boot service, one governor watchdog. Set it and forget it.
 
@@ -148,6 +148,14 @@ by +8% per detected OC headroom.
 
 - Steam Deck (LCD or OLED) running SteamOS, any recent build
 - Terminal access (desktop mode) and `sudo`
+
+
+## Tested hardware
+
+    Steam Deck (LCD and OLED) — designed for it, verified on real units, all 9 checks
+    ROG Ally Z1 Extreme (SteamOS) — confirmed working, all 9 checks pass
+
+Detection is calculated, not hardcoded — CPU/GPU clocks, physical RAM and the VRAM carve-out are probed at runtime, which is why non-Valve handhelds have a fighting chance. If you run it on something else and all 9 checks pass, report back and the list grows.
 
 ## Credits
 

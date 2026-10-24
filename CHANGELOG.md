@@ -1,3 +1,6 @@
+## v1.0.4 — 2026-10-24
+
+    ROG Ally Z1 Extreme (SteamOS) confirmed working — all 9 verify checks pass. No code changes needed: the calculated hardware detection (multi-card GPU sclk scan, physical RAM + VRAM carve-out) resolved correctly on non-Valve silicon. README gains a Tested hardware section — other SteamOS handhelds are invited to report results.
 # Changelog
 
 ## v1.0.3 — 2026-09-27
