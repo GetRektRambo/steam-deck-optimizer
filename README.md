@@ -1,6 +1,7 @@
-# Steam Deck Optimizer
+# SteamOS Optimizer
 
-A single-script system optimizer for SteamOS on the Steam Deck (LCD and OLED).
+A single-script system optimizer for handhelds running SteamOS (Script designed for steam deck) - has been tested on a Rog Ally Z1 Extreme running SteamOS. works as intended.
+
 One script, six modes, one boot service, one governor watchdog. Set it and forget it.
 
 **What this is not:** a magic FPS doubler. If someone promises you double
